@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm run build --prefix D:\\\\neyakeditor\\\\client 2>&1)"
+    ]
+  }
+}
