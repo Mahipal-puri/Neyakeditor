@@ -1,4 +1,4 @@
-import { defineConfig, loadEnv } from 'vite';
+﻿import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,7 +6,14 @@ import path from 'node:path';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
-    plugins: [react(), replicateProxy(env), mediapipeWasm(), templatesApi(env)],
+    plugins: [
+      react(),
+      replicateProxy(env),
+      replicateStylize(env),
+      animeganStylize(),
+      mediapipeWasm(),
+      templatesApi(env),
+    ],
     server: { port: 5173, open: true },
   };
 });
@@ -226,6 +233,370 @@ function replicateProxy(env) {
           res.statusCode = 500;
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ error: err.message ?? 'Unknown server error.' }));
+        }
+      });
+    },
+  };
+}
+
+/**
+ * Dev-only middleware that proxies `POST /api/stylize` to Replicate.
+ *
+ *   GET  /api/stylize          → { configured: boolean, perStyle: {ghibli, anime, cartoon, sketch}, fallbackModel }
+ *   POST /api/stylize          → image/* bytes of the styled output
+ *
+ * Model lookup per request:
+ *   1. If POST body has `style`, prefer `REPLICATE_<STYLE>_MODEL` (e.g. REPLICATE_GHIBLI_MODEL).
+ *   2. Otherwise fall back to `REPLICATE_STYLE_MODEL` (the generic single-model setting).
+ *   3. If neither is set, 503 with a friendly error.
+ *
+ * Lets the user run one model for everything OR pick a dedicated model per
+ * preset — Ghibli-fine-tune for Ghibli, anime-fine-tune for Anime, etc.
+ */
+function replicateStylize(env) {
+  const TOKEN = env.REPLICATE_API_TOKEN ?? '';
+  const FALLBACK_MODEL = env.REPLICATE_STYLE_MODEL ?? '';
+  const PER_STYLE = {
+    ghibli: env.REPLICATE_GHIBLI_MODEL ?? '',
+    anime: env.REPLICATE_ANIME_MODEL ?? '',
+    cartoon: env.REPLICATE_CARTOON_MODEL ?? '',
+    sketch: env.REPLICATE_SKETCH_MODEL ?? '',
+    watercolor: env.REPLICATE_WATERCOLOR_MODEL ?? '',
+    oilpaint: env.REPLICATE_OILPAINT_MODEL ?? '',
+    popart: env.REPLICATE_POPART_MODEL ?? '',
+    pixelart: env.REPLICATE_PIXELART_MODEL ?? '',
+  };
+  const resolveModel = (style) =>
+    (style && PER_STYLE[style]) || FALLBACK_MODEL;
+
+  return {
+    name: 'neyak-replicate-stylize',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/stylize', async (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
+
+        if (req.method === 'GET') {
+          const perStyleConfigured = Object.fromEntries(
+            Object.keys(PER_STYLE).map((k) => [
+              k,
+              Boolean(TOKEN && resolveModel(k)),
+            ])
+          );
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              configured: Boolean(TOKEN && FALLBACK_MODEL),
+              fallbackModel: FALLBACK_MODEL,
+              perStyle: perStyleConfigured,
+              perStyleModels: PER_STYLE,
+            })
+          );
+          return;
+        }
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end('Method not allowed');
+          return;
+        }
+        if (!TOKEN) {
+          res.statusCode = 503;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              error: 'REPLICATE_API_TOKEN is not set in client/.env.',
+            })
+          );
+          return;
+        }
+
+        try {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          const raw = Buffer.concat(chunks).toString('utf8');
+          const body = raw ? JSON.parse(raw) : {};
+          if (!body.image) throw new Error('Request body must include `image` (data URL).');
+          if (!body.prompt) throw new Error('Request body must include `prompt`.');
+
+          const model = resolveModel(body.style);
+          if (!model) {
+            res.statusCode = 503;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                error: body.style
+                  ? `No model configured for style "${body.style}". Set REPLICATE_${body.style.toUpperCase()}_MODEL or REPLICATE_STYLE_MODEL in client/.env.`
+                  : 'REPLICATE_STYLE_MODEL is not set in client/.env.',
+              })
+            );
+            return;
+          }
+
+          const r = await fetch(
+            `https://api.replicate.com/v1/models/${model}/predictions`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Token ${TOKEN}`,
+                'Content-Type': 'application/json',
+                Prefer: 'wait=60',
+              },
+              body: JSON.stringify({
+                input: { image: body.image, prompt: body.prompt },
+              }),
+            }
+          );
+
+          if (!r.ok) {
+            const errText = await r.text();
+            console.error('[stylize] Replicate API error', r.status, errText);
+            res.statusCode = r.status;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: `Replicate API ${r.status}: ${errText}` }));
+            return;
+          }
+
+          const prediction = await r.json();
+          if (prediction.status !== 'succeeded') {
+            res.statusCode = 202;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                error:
+                  prediction.error ||
+                  `Prediction still ${prediction.status}. Try again in a few seconds.`,
+                status: prediction.status,
+                id: prediction.id,
+              })
+            );
+            return;
+          }
+
+          const outputUrl = Array.isArray(prediction.output)
+            ? prediction.output[0]
+            : prediction.output;
+          if (!outputUrl) throw new Error('Replicate returned an empty output.');
+
+          const imgRes = await fetch(outputUrl);
+          if (!imgRes.ok) throw new Error(`Failed to fetch output image: ${imgRes.status}`);
+          const buffer = Buffer.from(await imgRes.arrayBuffer());
+          const ct = imgRes.headers.get('content-type') || 'image/png';
+
+          res.statusCode = 200;
+          res.setHeader('Content-Type', ct);
+          res.setHeader('Content-Length', String(buffer.length));
+          res.end(buffer);
+        } catch (err) {
+          console.error('[stylize]', err);
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: err.message ?? 'Unknown server error.' }));
+        }
+      });
+    },
+  };
+}
+
+/**
+ * Free photo→Ghibli/Anime/Sketch via AnimeGAN v2 on Hugging Face Spaces.
+ *
+ *   POST /api/animegan { image: dataUrl, style: 'ghibli'|'anime'|'sketch' }
+ *     → image/jpeg bytes of the stylized output
+ *
+ * AnimeGAN is a GAN specifically trained for photo→anime transformation. Unlike
+ * arbitrary style transfer (Magenta TFJS), it produces output that actually
+ * looks like Ghibli/Shinkai anime art while preserving the photo's composition
+ * exactly (GAN-based, not diffusion). Only the three styles the model was
+ * trained on are supported — other presets keep using neural style transfer.
+ *
+ * Upstream: akhaliq/AnimeGANv2 HF Space. Free, no auth. Gradio v3 API.
+ * Space may go cold and 503 — frontend falls back to neural style transfer.
+ */
+function animeganStylize() {
+  const SPACE_URL = 'https://akhaliq-animeganv2.hf.space';
+  // The Space only exposes "Version 1" / "Version 2" (no per-style picker).
+  // Version 2 is the newer/better model — use it for all our supported styles.
+  const SUPPORTED_STYLES = new Set(['ghibli', 'anime', 'sketch']);
+  const VERSION = 'Version 2';
+
+  async function readSSEEvent(reader, decoder, bufRef) {
+    // Returns the next parsed {event, data} pair or null on stream end.
+    while (true) {
+      const idx = bufRef.value.indexOf('\n\n');
+      if (idx >= 0) {
+        const block = bufRef.value.slice(0, idx);
+        bufRef.value = bufRef.value.slice(idx + 2);
+        let event = 'message';
+        let data = '';
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).trim();
+        }
+        return { event, data };
+      }
+      const { value, done } = await reader.read();
+      if (done) return null;
+      bufRef.value += decoder.decode(value, { stream: true });
+    }
+  }
+
+  async function runAnimeGAN(imageDataUrl) {
+    // Gradio v4+ flow:
+    //   1. POST /gradio_api/call/generate  → { event_id }
+    //   2. GET  /gradio_api/call/generate/<event_id>  (Server-Sent Events)
+    //   3. Stream emits 'complete' event with the result data.
+    //
+    // The image payload uses Gradio's FileData shape — base64 data URLs are
+    // accepted directly in the `url` field.
+    const postRes = await fetch(`${SPACE_URL}/gradio_api/call/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: [
+          { url: imageDataUrl, meta: { _type: 'gradio.FileData' } },
+          VERSION,
+        ],
+      }),
+    });
+    if (!postRes.ok) {
+      const errText = await postRes.text().catch(() => '');
+      throw new Error(
+        `Gradio POST ${postRes.status}: ${errText.slice(0, 200) || '(empty body)'}`
+      );
+    }
+    const { event_id } = await postRes.json();
+    if (!event_id) throw new Error('Gradio POST returned no event_id.');
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 90_000);
+
+    let sseRes;
+    try {
+      sseRes = await fetch(
+        `${SPACE_URL}/gradio_api/call/generate/${event_id}`,
+        { signal: ctrl.signal }
+      );
+    } catch (err) {
+      clearTimeout(timer);
+      if (err.name === 'AbortError') {
+        throw new Error(
+          'HF Space timed out after 90 s (likely cold-starting; try again in a moment).'
+        );
+      }
+      throw err;
+    }
+
+    if (!sseRes.ok || !sseRes.body) {
+      clearTimeout(timer);
+      throw new Error(`Gradio SSE returned ${sseRes.status}`);
+    }
+
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    const bufRef = { value: '' };
+    let result = null;
+    let upstreamError = null;
+
+    try {
+      while (true) {
+        const evt = await readSSEEvent(reader, decoder, bufRef);
+        if (!evt) break;
+        if (evt.event === 'complete' && evt.data) {
+          try {
+            result = JSON.parse(evt.data);
+          } catch {
+            throw new Error(`SSE data parse failed: ${evt.data.slice(0, 120)}`);
+          }
+          break;
+        }
+        if (evt.event === 'error') {
+          upstreamError = evt.data || 'unspecified upstream error';
+          break;
+        }
+        // 'generating' / 'heartbeat' events are progress — ignore.
+      }
+    } finally {
+      clearTimeout(timer);
+      reader.cancel().catch(() => {});
+    }
+
+    if (upstreamError) throw new Error(`Gradio reported: ${upstreamError}`);
+    if (!result) throw new Error('SSE stream ended without a complete event.');
+
+    const outFile = Array.isArray(result) ? result[0] : result;
+    const outUrl = outFile?.url ||
+      (outFile?.path ? `${SPACE_URL}/gradio_api/file=${outFile.path}` : null);
+    if (!outUrl) {
+      throw new Error(
+        `Unexpected output shape: ${JSON.stringify(result).slice(0, 200)}`
+      );
+    }
+
+    const imgRes = await fetch(outUrl);
+    if (!imgRes.ok) throw new Error(`Output fetch returned ${imgRes.status}`);
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    if (buffer.length < 1024) {
+      throw new Error(`Suspicious tiny response: ${buffer.length} bytes.`);
+    }
+    return {
+      buffer,
+      contentType: imgRes.headers.get('content-type') || 'image/jpeg',
+    };
+  }
+
+  return {
+    name: 'neyak-animegan-stylize',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/animegan', async (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
+
+        if (req.method === 'GET') {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              configured: true,
+              styles: [...SUPPORTED_STYLES],
+              upstream: SPACE_URL,
+              gradioVersion: 'v4+ (/gradio_api/call streaming)',
+            })
+          );
+          return;
+        }
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end('Method not allowed');
+          return;
+        }
+
+        try {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          const raw = Buffer.concat(chunks).toString('utf8');
+          const body = raw ? JSON.parse(raw) : {};
+          if (!body.image) throw new Error('Missing `image` (data URL).');
+          if (!body.style) throw new Error('Missing `style`.');
+          if (!SUPPORTED_STYLES.has(body.style)) {
+            throw new Error(
+              `AnimeGAN doesn't support "${body.style}". Supported: ${[...SUPPORTED_STYLES].join(', ')}.`
+            );
+          }
+          if (!/^data:[^;]+;base64,/.test(body.image)) {
+            throw new Error('`image` must be a base64 data URL.');
+          }
+
+          const { buffer, contentType } = await runAnimeGAN(body.image);
+          res.statusCode = 200;
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Content-Length', String(buffer.length));
+          res.end(buffer);
+        } catch (err) {
+          console.error('[animegan]', err);
+          res.statusCode = 502;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: err.message ?? 'Upstream error.' }));
         }
       });
     },

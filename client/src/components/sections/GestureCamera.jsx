@@ -113,23 +113,41 @@ export default function GestureCamera({
           lastDetectAtRef.current = now;
           const result = landmarker.detectForVideo(video, now);
           const hands = result?.landmarks ?? [];
+          const handednesses = result?.handednesses ?? [];
 
-          // Classify each hand individually so the overlay can label each one.
-          const perHand = hands.map((h) => classifyGesture(h));
+          // Classify each hand + attach handedness ("Left" / "Right") from MediaPipe.
+          const perHand = hands.map((h, i) => ({
+            ...classifyGesture(h),
+            side: handednesses[i]?.[0]?.categoryName ?? 'Unknown',
+          }));
 
-          let g;
-          if (hands.length >= 2) {
-            g = classifyTwoHandedGesture(hands);
-          } else if (hands.length === 1) {
-            g = perHand[0];
-          } else {
-            g = { name: 'none' };
+          // First detected per side wins (defensive against duplicate labels).
+          let rightHand = null;
+          let leftHand = null;
+          for (const g of perHand) {
+            if (g.side === 'Right' && !rightHand) rightHand = g;
+            else if (g.side === 'Left' && !leftHand) leftHand = g;
           }
 
-          drawOverlay(canvas, hands, perHand, g);
+          // Two-hand zoom only when BOTH hands are at rest — so a one-hand pinch
+          // or peace never gets clobbered by zoom while the other hand is up.
+          const REST = new Set(['palm', 'fist', 'unknown', 'none']);
+          let twoHand = null;
+          if (hands.length >= 2 && perHand.every((g) => REST.has(g.name))) {
+            twoHand = classifyTwoHandedGesture(hands);
+          }
 
-          setGestureName((prev) => (prev === g.name ? prev : g.name));
-          onGestureRef.current?.(g);
+          drawOverlay(canvas, hands, perHand, twoHand);
+
+          // Chip name: twoHand → right → left → none, so it always reflects
+          // the most actionable gesture currently in play.
+          const primary =
+            twoHand?.name === 'two_hand_zoom'
+              ? twoHand
+              : rightHand ?? leftHand ?? { name: 'none' };
+          setGestureName((prev) => (prev === primary.name ? prev : primary.name));
+
+          onGestureRef.current?.({ left: leftHand, right: rightHand, twoHand });
         }
       } catch (err) {
         console.error('[gestures] tick error', err);
@@ -335,6 +353,10 @@ export default function GestureCamera({
       </div>
 
       <div className="text-[11px] text-slate-400 space-y-1 leading-relaxed">
+        <div className="mb-2 text-[11px] text-slate-300">
+          <span className="text-neon-cyan font-semibold">Right hand</span> ➜ main image ·{' '}
+          <span className="text-neon-pink font-semibold">Left hand</span> ➜ merge layer
+        </div>
         <div className="grid grid-cols-2 gap-x-3 gap-y-1">
           <span><span className="text-neon-cyan">Pinch 🤏</span> — set active</span>
           <span><span className="text-amber-300">Point ☝️</span> — set active</span>
@@ -362,9 +384,17 @@ function drawOverlay(canvas, hands, perHand, twoHandResult) {
 
   if (!hands?.length) return;
 
-  // Skeleton + landmark dots for each hand.
-  for (const hand of hands) {
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.9)';
+  // Skeleton + landmark dots, colored by hand side so L vs R is readable at a glance.
+  for (let i = 0; i < hands.length; i++) {
+    const hand = hands[i];
+    const side = perHand[i]?.side;
+    const skeletonColor =
+      side === 'Right'
+        ? 'rgba(34, 211, 238, 0.9)' // cyan
+        : side === 'Left'
+        ? 'rgba(236, 72, 153, 0.9)' // pink
+        : 'rgba(168, 85, 247, 0.9)'; // purple fallback
+    ctx.strokeStyle = skeletonColor;
     ctx.lineWidth = 3;
     for (const [a, b] of HAND_CONNECTIONS) {
       const p1 = hand[a];
@@ -383,12 +413,11 @@ function drawOverlay(canvas, hands, perHand, twoHandResult) {
     }
   }
 
-  // Per-hand emoji label, floating above the wrist (landmark 0).
+  // Per-hand emoji + L/R glyph, floating above the wrist (landmark 0).
   // Canvas is CSS-mirrored to match user-facing video, so we counter-mirror
-  // the text glyph rendering so emojis are not flipped.
+  // the text glyph rendering so emojis/letters are not flipped.
   ctx.save();
   ctx.scale(-1, 1);
-  ctx.font = 'bold 42px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   for (let i = 0; i < hands.length; i++) {
@@ -396,15 +425,31 @@ function drawOverlay(canvas, hands, perHand, twoHandResult) {
     const wrist = hand[0];
     if (!wrist) continue;
     const emoji = GESTURE_EMOJI[perHand[i]?.name] ?? '👋';
+    const side = perHand[i]?.side;
+    const sideLabel = side === 'Right' ? 'R' : side === 'Left' ? 'L' : '?';
+    const sideColor = side === 'Right' ? '#22d3ee' : side === 'Left' ? '#ec4899' : '#a855f7';
     const x = -wrist.x * w; // mirror compensation
     const y = wrist.y * h - 36;
-    // soft shadow disc behind the emoji for visibility on bright frames
-    ctx.fillStyle = 'rgba(5, 6, 15, 0.6)';
+
+    // Soft shadow disc behind the emoji for visibility on bright frames.
+    ctx.fillStyle = 'rgba(5, 6, 15, 0.65)';
     ctx.beginPath();
-    ctx.arc(x, y, 24, 0, Math.PI * 2);
+    ctx.arc(x, y, 26, 0, Math.PI * 2);
     ctx.fill();
+
+    // Emoji
+    ctx.font = 'bold 38px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
     ctx.fillStyle = '#ffffff';
     ctx.fillText(emoji, x, y);
+
+    // L/R badge — small, top-right of the disc, colored by side.
+    ctx.font = 'bold 14px "Inter",system-ui,sans-serif';
+    ctx.fillStyle = 'rgba(5, 6, 15, 0.85)';
+    ctx.beginPath();
+    ctx.arc(x + 22, y - 18, 9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = sideColor;
+    ctx.fillText(sideLabel, x + 22, y - 18);
   }
   ctx.restore();
 

@@ -19,6 +19,18 @@ import {
   X,
 } from 'lucide-react';
 import { fetchTemplate } from '../lib/templatesApi';
+import { bakeStyle } from '../lib/stylize';
+import {
+  loadNeuralModel,
+  neuralReady,
+  applyNeuralStyle,
+  hasStyleReference,
+  setStyleReference,
+  clearStyleReference,
+  loadStyleReferenceImage,
+  fileToStyleDataUrl,
+} from '../lib/neuralStyle';
+import { generateDefaultStyleRef } from '../lib/defaultStyleRefs';
 import GlassCard from '../components/ui/GlassCard';
 import GradientText from '../components/ui/GradientText';
 import NeonButton from '../components/ui/NeonButton';
@@ -36,6 +48,70 @@ const DEFAULT_FILTERS = {
   sepia: 0,
   invert: 0,
 };
+
+// AI style presets — each is one Replicate img2img call (when REPLICATE_STYLE_MODEL
+// is configured) OR a real image-processing pipeline (Sobel edges, posterization,
+// bloom — see lib/stylize.js) baked into the merge layer when it isn't. The
+// fallback produces a stylized rendering of the photo's pixels, not a regenerated
+// character — that requires the Replicate path.
+const STYLE_PRESETS = [
+  {
+    id: 'ghibli',
+    label: 'Ghibli',
+    emoji: '🍃',
+    prompt:
+      'studio ghibli anime style, hand-drawn animation cel, soft watercolor background, dreamy pastel palette, miyazaki inspired',
+  },
+  {
+    id: 'anime',
+    label: 'Anime',
+    emoji: '✨',
+    prompt:
+      'anime style portrait, vibrant saturated colors, manga aesthetic, cel-shaded, sharp lineart, japanese animation',
+  },
+  {
+    id: 'cartoon',
+    label: 'Cartoon',
+    emoji: '🎨',
+    prompt:
+      'cartoon illustration, bold black outlines, flat saturated colors, comic book style, cel-shaded',
+  },
+  {
+    id: 'sketch',
+    label: 'Sketch',
+    emoji: '✏️',
+    prompt:
+      'pencil sketch on paper, monochrome graphite drawing, detailed cross-hatch shading, hand drawn, paper texture',
+  },
+  {
+    id: 'watercolor',
+    label: 'Watercolor',
+    emoji: '💧',
+    prompt:
+      'watercolor painting, soft pigment bleeds, wet-on-wet brush strokes, paper texture, gentle muted palette',
+  },
+  {
+    id: 'oilpaint',
+    label: 'Oil paint',
+    emoji: '🖌️',
+    prompt:
+      'oil painting, thick textured brush strokes, classical art, rich layered pigments, painterly impressionist style',
+  },
+  {
+    id: 'popart',
+    label: 'Pop art',
+    emoji: '🌈',
+    prompt:
+      'pop art style, flat saturated primary colors, bold black outlines, comic book halftone, Warhol Lichtenstein inspired',
+  },
+  {
+    id: 'pixelart',
+    label: 'Pixel art',
+    emoji: '👾',
+    prompt:
+      'pixel art, 16-bit retro game sprite, chunky pixels, limited palette, crisp blocky aesthetic',
+  },
+];
 
 const PRESETS = [
   { name: 'Original', filters: DEFAULT_FILTERS },
@@ -126,6 +202,114 @@ export default function Editor() {
   const [secondBlend, setSecondBlend] = useState('normal');
   const secondInputRef = useRef(null);
   const secondImageRef = useRef(null);
+
+  // AI style state.
+  const [stylizing, setStylizing] = useState(null); // active preset id while in flight
+  // Per-style configured flags from GET /api/stylize, e.g. { ghibli: true, anime: false, ... }.
+  // Treat the whole map as "any AI is wired" when computing the card subtitle.
+  const [stylizeConfigured, setStylizeConfigured] = useState({});
+  const anyStyleConfigured = Object.values(stylizeConfigured).some(Boolean);
+  // Effect strength 0..100; passed to bakeStyle as intensity/100 for local
+  // pipelines. The Replicate path doesn't use it (different models expose
+  // different strength knobs; not worth a unified abstraction yet).
+  const [styleIntensity, setStyleIntensity] = useState(100);
+
+  // Neural style transfer (TFJS) state.
+  // styleRefMap: { ghibli: bool, ... } — whether a style reference image is
+  // cached in localStorage for that preset. If true, button uses neural path.
+  const [styleRefMap, setStyleRefMap] = useState({});
+  const [neuralModelLoaded, setNeuralModelLoaded] = useState(false);
+  const styleRefInputRef = useRef(null);
+  const pendingStyleRefIdRef = useRef(null);
+
+  // Seed procedurally-drawn default style references for any preset that
+  // doesn't already have one, then initialize styleRefMap. Defaults make the
+  // neural transfer path the default routing for every button — a user upload
+  // via the "+" icon still overrides per-preset.
+  useEffect(() => {
+    STYLE_PRESETS.forEach((p) => {
+      if (!hasStyleReference(p.id)) {
+        const url = generateDefaultStyleRef(p.id);
+        if (url) setStyleReference(p.id, url);
+      }
+    });
+    setStyleRefMap(
+      Object.fromEntries(STYLE_PRESETS.map((p) => [p.id, hasStyleReference(p.id)]))
+    );
+    setNeuralModelLoaded(neuralReady());
+  }, []);
+
+  // Pre-warm the neural model in the background once the user uploads an
+  // image — by the time they click a style button the ~11 MB download has
+  // already finished (or is well underway), so the click runs inference only.
+  useEffect(() => {
+    if (!imgMeta || neuralModelLoaded) return;
+    let cancelled = false;
+    loadNeuralModel()
+      .then(() => {
+        if (!cancelled) setNeuralModelLoaded(true);
+      })
+      .catch(() => {
+        /* ignore — actual click path will surface the error */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [imgMeta, neuralModelLoaded]);
+
+  const openStyleRefPicker = (presetId) => {
+    pendingStyleRefIdRef.current = presetId;
+    styleRefInputRef.current?.click();
+  };
+
+  const onStyleRefFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    const presetId = pendingStyleRefIdRef.current;
+    pendingStyleRefIdRef.current = null;
+    if (!file || !presetId) return;
+    if (!file.type.startsWith('image/')) {
+      toast('Style reference must be an image.', { type: 'warning' });
+      return;
+    }
+    try {
+      const dataUrl = await fileToStyleDataUrl(file);
+      const ok = setStyleReference(presetId, dataUrl);
+      if (!ok) throw new Error('Browser blocked the cache write (storage full?)');
+      setStyleRefMap((prev) => ({ ...prev, [presetId]: true }));
+      const preset = STYLE_PRESETS.find((p) => p.id === presetId);
+      toast(`${preset?.label ?? presetId}: style reference saved.`, {
+        type: 'success',
+      });
+    } catch (err) {
+      toast(`Style reference failed: ${err.message}`, { type: 'warning' });
+    }
+  };
+
+  const clearStyleRefFor = (presetId) => {
+    clearStyleReference(presetId);
+    setStyleRefMap((prev) => ({ ...prev, [presetId]: false }));
+    const preset = STYLE_PRESETS.find((p) => p.id === presetId);
+    toast(`${preset?.label ?? presetId}: style reference cleared.`);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/stylize')
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        // perStyle is the authoritative per-button map; `configured` only reflects
+        // the generic fallback model.
+        setStylizeConfigured(data?.perStyle ?? {});
+      })
+      .catch(() => {
+        if (!cancelled) setStylizeConfigured({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const templateLoadedRef = useRef(false);
@@ -371,7 +555,7 @@ export default function Editor() {
     showFlash(RotateCcw, 'Reset');
   }, [toast, showFlash, secondSrc]);
 
-  // Gesture debounce / hold tracking
+  // Gesture debounce / hold tracking — right hand (first image)
   const lastRotateRef = useRef(0);
   const lastFlipRef = useRef(0);
   const lastFlipVRef = useRef(0);
@@ -380,6 +564,11 @@ export default function Editor() {
   const lastBgRef = useRef(0);
   const fistHoldStartRef = useRef(null);
   const presetIndexRef = useRef(0);
+
+  // Left hand (second image / merge layer)
+  const lastBlendCycleRef = useRef(0);
+  const lastLayerResetRef = useRef(0);
+  const leftFistHoldRef = useRef(null);
 
   // Stable refs to functions/state that handleGesture wants to call from
   // inside its RAF-driven loop without re-binding every render.
@@ -423,77 +612,136 @@ export default function Editor() {
   }, [toast, showFlash]);
 
   const handleGesture = useCallback(
-    (g) => {
+    ({ left, right, twoHand }) => {
       // Pause all gesture-driven mutations while BG removal is in flight —
       // otherwise the result swap would clobber any sliders the user moved.
       if (removingBgRef.current) return;
       const now = performance.now();
 
-      if (g.name === 'pinch' && g.payload) {
-        setActiveValue(g.payload.t);
-      } else if (g.name === 'point' && g.payload) {
-        // Video is mirrored on screen; invert X so "right side of screen" = max.
-        setActiveValue(1 - g.payload.x);
-      } else if (g.name === 'two_hand_zoom' && g.payload) {
+      // ---- Two-hand zoom — only ever emitted upstream when both hands rest.
+      if (twoHand?.name === 'two_hand_zoom' && twoHand.payload) {
         // distance 0.10..0.60 → zoom 0.5..3.0; only update on ≥ 0.01 delta.
         const z = Math.min(
           3,
-          Math.max(0.5, 0.5 + (g.payload.distance - 0.1) * 5)
+          Math.max(0.5, 0.5 + (twoHand.payload.distance - 0.1) * 5)
         );
         setZoom((prev) => (Math.abs(prev - z) < 0.01 ? prev : z));
-      } else if (g.name === 'rock_n_roll') {
-        if (now - lastFlipVRef.current > 800) {
-          lastFlipVRef.current = now;
-          setFlipV((v) => !v);
-          toast('Flipped V');
-          showFlash(FlipVertical, 'Flipped V');
+      }
+
+      // ---- RIGHT hand → first image (existing behavior, just re-keyed off `right`).
+      if (right) {
+        const g = right;
+        if (g.name === 'pinch' && g.payload) {
+          setActiveValue(g.payload.t);
+        } else if (g.name === 'point' && g.payload) {
+          // Video is mirrored on screen; invert X so "right side of screen" = max.
+          setActiveValue(1 - g.payload.x);
+        } else if (g.name === 'rock_n_roll') {
+          if (now - lastFlipVRef.current > 800) {
+            lastFlipVRef.current = now;
+            setFlipV((v) => !v);
+            toast('Flipped V');
+            showFlash(FlipVertical, 'Flipped V');
+          }
+        } else if (g.name === 'two_fingers') {
+          if (now - lastCycleRef.current > 800) {
+            lastCycleRef.current = now;
+            cycleActive();
+          }
+        } else if (g.name === 'three_fingers') {
+          if (now - lastRotateRef.current > 800) {
+            lastRotateRef.current = now;
+            setRotation((r) => (r + 90) % 360);
+            toast('Rotated 90°');
+            showFlash(RotateCw, 'Rotated 90°');
+          }
+        } else if (g.name === 'four_fingers') {
+          if (now - lastFlipRef.current > 800) {
+            lastFlipRef.current = now;
+            setFlipH((v) => !v);
+            toast('Flipped');
+            showFlash(FlipHorizontal, 'Flipped');
+          }
+        } else if (g.name === 'thumbs_up') {
+          if (now - lastPresetRef.current > 1000) {
+            lastPresetRef.current = now;
+            cyclePreset();
+          }
+        } else if (g.name === 'shaka') {
+          // Long cooldown — the Replicate round-trip is 5-20s, don't queue
+          // a second call from the next frame.
+          if (now - lastBgRef.current > 3000) {
+            lastBgRef.current = now;
+            showFlash(Scissors, 'Removing background');
+            removeBackgroundRef.current?.();
+          }
+        } else if (g.name === 'fist') {
+          if (fistHoldStartRef.current == null) {
+            fistHoldStartRef.current = now;
+          } else if (now - fistHoldStartRef.current > 1000) {
+            reset();
+            showFlash(RotateCcw, 'Reset');
+            fistHoldStartRef.current = null;
+          }
         }
-      } else if (g.name === 'two_fingers') {
-        if (now - lastCycleRef.current > 800) {
-          lastCycleRef.current = now;
-          cycleActive();
-        }
-      } else if (g.name === 'three_fingers') {
-        if (now - lastRotateRef.current > 800) {
-          lastRotateRef.current = now;
-          setRotation((r) => (r + 90) % 360);
-          toast('Rotated 90°');
-          showFlash(RotateCw, 'Rotated 90°');
-        }
-      } else if (g.name === 'four_fingers') {
-        if (now - lastFlipRef.current > 800) {
-          lastFlipRef.current = now;
-          setFlipH((v) => !v);
-          toast('Flipped');
-          showFlash(FlipHorizontal, 'Flipped');
-        }
-      } else if (g.name === 'thumbs_up') {
-        if (now - lastPresetRef.current > 1000) {
-          lastPresetRef.current = now;
-          cyclePreset();
-        }
-      } else if (g.name === 'shaka') {
-        // Long cooldown — the Replicate round-trip is 5-20s, don't queue
-        // a second call from the next frame.
-        if (now - lastBgRef.current > 3000) {
-          lastBgRef.current = now;
-          showFlash(Scissors, 'Removing background');
-          removeBackgroundRef.current?.();
-        }
-      } else if (g.name === 'fist') {
-        if (fistHoldStartRef.current == null) {
-          fistHoldStartRef.current = now;
-        } else if (now - fistHoldStartRef.current > 1000) {
-          reset();
-          showFlash(RotateCcw, 'Reset');
+        if (g.name !== 'fist') {
           fistHoldStartRef.current = null;
         }
-      }
-      if (g.name !== 'fist') {
+      } else {
+        // No right hand visible — drop any in-progress fist hold.
         fistHoldStartRef.current = null;
       }
+
+      // ---- LEFT hand → second image (merge layer).
+      if (left) {
+        const g = left;
+        if (g.name === 'pinch' && g.payload) {
+          // pinch.t (0..1) maps directly to opacity 0..1.
+          setSecondOpacity(g.payload.t);
+        } else if (g.name === 'point' && g.payload) {
+          // Same mirror compensation as the right-hand point.
+          setSecondOpacity(Math.min(1, Math.max(0, 1 - g.payload.x)));
+        } else if (g.name === 'two_fingers') {
+          if (now - lastBlendCycleRef.current > 800) {
+            lastBlendCycleRef.current = now;
+            setSecondBlend((curr) => {
+              const idx = BLEND_MODES.indexOf(curr);
+              const next = BLEND_MODES[(idx + 1) % BLEND_MODES.length];
+              toast(`Layer blend: ${next}`);
+              showFlash(Layers, next);
+              return next;
+            });
+          }
+        } else if (g.name === 'thumbs_up') {
+          if (now - lastLayerResetRef.current > 1000) {
+            lastLayerResetRef.current = now;
+            setSecondOpacity(0.6);
+            setSecondBlend('normal');
+            toast('Layer reset');
+            showFlash(Sparkles, 'Layer reset');
+          }
+        } else if (g.name === 'fist') {
+          if (leftFistHoldRef.current == null) {
+            leftFistHoldRef.current = now;
+          } else if (now - leftFistHoldRef.current > 1000) {
+            if (secondSrc) {
+              clearSecondImage();
+              toast('Layer cleared');
+              showFlash(Trash2, 'Layer cleared');
+            }
+            leftFistHoldRef.current = null;
+          }
+        }
+        // three_fingers / four_fingers / rock_n_roll / shaka on left are intentional no-ops —
+        // rotate/flip/BG-remove only make sense for the base image.
+        if (g.name !== 'fist') {
+          leftFistHoldRef.current = null;
+        }
+      } else {
+        leftFistHoldRef.current = null;
+      }
     },
-    [reset, setActiveValue, cycleActive, cyclePreset, toast, showFlash]
+    [reset, setActiveValue, cycleActive, cyclePreset, toast, showFlash, secondSrc]
   );
 
   const clearImage = () => {
@@ -638,6 +886,195 @@ export default function Editor() {
     removeBackgroundRef.current = removeBackground;
   });
 
+  const applyStyle = async (preset) => {
+    if (!imgSrc || !imageRef.current || !imgMeta || stylizing || removingBg) return;
+    setStylizing(preset.id);
+    try {
+      let blob;
+      let displayOpacity;
+      let displayBlend;
+      let sourceTag;
+
+      // Bakes current CSS filters + rotation + flips onto a data URL so any
+      // remote AI sees what the user sees, not the un-edited original.
+      const bakeCurrentEdits = (mime = 'image/jpeg', quality = 0.9) => {
+        const swap = rotation === 90 || rotation === 270;
+        const w = swap ? imgMeta.height : imgMeta.width;
+        const h = swap ? imgMeta.width : imgMeta.height;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('Canvas context unavailable');
+        ctx.filter = buildFilterString(filters);
+        ctx.translate(w / 2, h / 2);
+        ctx.rotate((rotation * Math.PI) / 180);
+        ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+        ctx.drawImage(
+          imageRef.current,
+          -imgMeta.width / 2,
+          -imgMeta.height / 2,
+          imgMeta.width,
+          imgMeta.height
+        );
+        return canvas.toDataURL(mime, quality);
+      };
+
+      const ANIMEGAN_STYLES = new Set(['ghibli', 'anime', 'sketch']);
+
+      if (stylizeConfigured[preset.id]) {
+        // Replicate path: bake current edits (filters + rotation + flips) so the
+        // AI sees what the user sees, then POST to /api/stylize with the preset prompt.
+        const swap = rotation === 90 || rotation === 270;
+        const w = swap ? imgMeta.height : imgMeta.width;
+        const h = swap ? imgMeta.width : imgMeta.height;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('Canvas context unavailable');
+        ctx.filter = buildFilterString(filters);
+        ctx.translate(w / 2, h / 2);
+        ctx.rotate((rotation * Math.PI) / 180);
+        ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+        ctx.drawImage(
+          imageRef.current,
+          -imgMeta.width / 2,
+          -imgMeta.height / 2,
+          imgMeta.width,
+          imgMeta.height
+        );
+        const dataUrl = canvas.toDataURL('image/png');
+
+        toast(`Applying ${preset.label} via Replicate — usually 10–30 seconds…`);
+        const res = await fetch('/api/stylize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image: dataUrl,
+            prompt: preset.prompt,
+            style: preset.id,
+          }),
+        });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error || `HTTP ${res.status}`);
+        }
+        blob = await res.blob();
+        // The AI result is itself the styled image — show it opaque on top by default.
+        displayOpacity = 1;
+        displayBlend = 'normal';
+        sourceTag = 'ai';
+      } else if (ANIMEGAN_STYLES.has(preset.id)) {
+        // AnimeGAN v2 via Hugging Face Space (free, no auth). The GAN is
+        // specifically trained for photo→Ghibli/Anime/Sketch. Composition is
+        // preserved (GAN, not diffusion) and output actually looks like anime
+        // art, not just filtered pixels. Spaces can be cold; on failure we
+        // fall through to neural style transfer.
+        try {
+          const dataUrl = bakeCurrentEdits('image/jpeg', 0.9);
+          toast(
+            `Painting ${preset.label} via AnimeGAN on Hugging Face — usually 10–30 s…`
+          );
+          const res = await fetch('/api/animegan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: dataUrl, style: preset.id }),
+          });
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}));
+            throw new Error(errBody.error || `HTTP ${res.status}`);
+          }
+          const candidate = await res.blob();
+          if (candidate.size < 1024) {
+            throw new Error('Upstream returned an empty response.');
+          }
+          blob = candidate;
+          displayOpacity = 1;
+          displayBlend = 'normal';
+          sourceTag = 'animegan';
+        } catch (err) {
+          console.warn('[applyStyle] AnimeGAN failed, falling back', err);
+          toast(
+            `AnimeGAN unavailable (${(err.message || '').slice(0, 60)}). Falling back to neural style…`,
+            { type: 'warning' }
+          );
+        }
+      }
+
+      if (!blob && styleRefMap[preset.id]) {
+        // Neural style transfer (TFJS) — paints the photo in the style of the
+        // reference image. Real ML, but the silhouette is kept; for face
+        // redraw they still need Replicate/AnimeGAN.
+        try {
+          if (!neuralReady()) {
+            toast(
+              `Loading neural model (~11 MB, one-time)… ${preset.label} will run after.`
+            );
+            await loadNeuralModel();
+            setNeuralModelLoaded(true);
+          }
+          const styleImg = await loadStyleReferenceImage(preset.id);
+          if (!styleImg) throw new Error('Style reference image missing.');
+          toast(`Painting ${preset.label} via neural style transfer…`);
+          blob = await applyNeuralStyle(imageRef.current, styleImg, {
+            cacheKey: preset.id,
+          });
+          displayOpacity = 1;
+          displayBlend = 'normal';
+          sourceTag = 'neural';
+        } catch (err) {
+          console.warn('[applyStyle] neural failed, falling back', err);
+        }
+      }
+
+      if (!blob) {
+        // Final fallback: classical CV pipeline (bilateral + palette +
+        // outlines). Always succeeds — stylizes existing pixels rather than
+        // redrawing the subject.
+        blob = await bakeStyle(
+          preset.id,
+          imageRef.current,
+          imgMeta.width,
+          imgMeta.height,
+          styleIntensity / 100
+        );
+        displayOpacity = 1;
+        displayBlend = 'normal';
+        sourceTag = 'filter';
+        toast(
+          `${preset.label} stylized locally at ${styleIntensity}% intensity — for character regeneration, set REPLICATE_STYLE_MODEL in .env.`
+        );
+      }
+
+      const baseName = (imgMeta.name || 'image').replace(/\.[^.]+$/, '');
+      const newName = `${baseName}-${preset.id}-${sourceTag}.png`;
+      const newUrl = URL.createObjectURL(blob);
+
+      const probe = new Image();
+      probe.onload = () => {
+        setSecondMeta({
+          width: probe.naturalWidth,
+          height: probe.naturalHeight,
+          name: newName,
+        });
+      };
+      probe.src = newUrl;
+
+      // Replace any existing merge layer.
+      if (secondSrc) URL.revokeObjectURL(secondSrc);
+      setSecondSrc(newUrl);
+      setSecondOpacity(displayOpacity);
+      setSecondBlend(displayBlend);
+
+      toast(`${preset.label} layered on as merge image.`, { type: 'success' });
+    } catch (err) {
+      toast(`${preset.label} failed: ${err.message}`, { type: 'warning' });
+    } finally {
+      setStylizing(null);
+    }
+  };
+
   const filterCss = useMemo(() => buildFilterString(filters), [filters]);
   const transformCss = useMemo(
     () =>
@@ -718,6 +1155,13 @@ export default function Editor() {
           className="hidden"
           onChange={onSecondFileChange}
         />
+        <input
+          ref={styleRefInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          className="hidden"
+          onChange={onStyleRefFileChange}
+        />
       </header>
 
       <section className="container-page pb-24">
@@ -728,30 +1172,32 @@ export default function Editor() {
               {imgSrc ? (
                 <div className="space-y-4">
                   <div className="relative w-full min-h-[320px] sm:min-h-[480px] checker rounded-xl overflow-hidden flex items-center justify-center p-4">
-                    <img
-                      ref={imageRef}
-                      src={imgSrc}
-                      alt="Edited preview"
-                      crossOrigin="anonymous"
-                      className="max-w-full max-h-[68vh] object-contain transition-all"
-                      style={{
-                        filter: filterCss,
-                        transform: transformCss,
-                      }}
-                    />
-                    {secondSrc && (
+                    <div className="relative inline-block max-w-full max-h-[68vh] isolate">
                       <img
-                        ref={secondImageRef}
-                        src={secondSrc}
-                        alt="Second layer"
+                        ref={imageRef}
+                        src={imgSrc}
+                        alt="Edited preview"
                         crossOrigin="anonymous"
-                        className="absolute inset-0 m-auto max-w-full max-h-[68vh] object-contain pointer-events-none p-4"
+                        className="block max-w-full max-h-[68vh] object-contain transition-all"
                         style={{
-                          opacity: secondOpacity,
-                          mixBlendMode: secondBlend,
+                          filter: filterCss,
+                          transform: transformCss,
                         }}
                       />
-                    )}
+                      {secondSrc && (
+                        <img
+                          ref={secondImageRef}
+                          src={secondSrc}
+                          alt="Second layer"
+                          crossOrigin="anonymous"
+                          className="absolute inset-0 w-full h-full object-contain pointer-events-none z-10"
+                          style={{
+                            opacity: secondOpacity,
+                            mixBlendMode: secondBlend,
+                          }}
+                        />
+                      )}
+                    </div>
                     {/* Active-control HUD: always-visible chip showing which
                         slider gestures currently target, plus its live value. */}
                     {(() => {
@@ -919,6 +1365,102 @@ export default function Editor() {
                   </button>
                 ))}
               </div>
+            </GlassCard>
+
+            <GlassCard hover={false}>
+              <h3 className="font-display font-semibold mb-1 flex items-center gap-2">
+                <Wand2 size={16} className="text-neon-purple" /> AI styles
+              </h3>
+              <p className="text-[11px] text-slate-400 mb-3 leading-snug">
+                {anyStyleConfigured
+                  ? `Replicate ready for ${
+                      Object.entries(stylizeConfigured)
+                        .filter(([, v]) => v)
+                        .map(([k]) => k)
+                        .join(', ')
+                    } · 10–30 s · regenerates as a character.`
+                  : 'Click + on a button to upload a style image — runs real neural style transfer in your browser. Otherwise uses local stylization.'}
+              </p>
+              <div className="mb-3">
+                <SliderRow
+                  label="Intensity (local only)"
+                  value={styleIntensity}
+                  min={10}
+                  max={100}
+                  unit="%"
+                  active={false}
+                  onActivate={() => {}}
+                  onChange={(v) => setStyleIntensity(Number(v))}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {STYLE_PRESETS.map((preset) => {
+                  const ai = stylizeConfigured[preset.id];
+                  const hasRef = styleRefMap[preset.id];
+                  const neural = !ai && hasRef;
+                  const tooltip = ai
+                    ? 'AI character regen via Replicate'
+                    : neural
+                    ? 'Neural style transfer (TFJS) using your uploaded style image'
+                    : 'Local stylization · click + to enable neural transfer';
+                  return (
+                    <div key={preset.id} className="relative">
+                      <button
+                        type="button"
+                        onClick={() => applyStyle(preset)}
+                        disabled={!imgSrc || Boolean(stylizing) || removingBg}
+                        title={tooltip}
+                        className="relative w-full pl-6 pr-7 py-2 rounded-lg text-xs font-medium glass text-slate-200 hover:bg-white/10 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5 justify-center"
+                      >
+                        {stylizing === preset.id ? (
+                          <>
+                            <Loader2 size={12} className="animate-spin" /> Applying…
+                          </>
+                        ) : (
+                          <>
+                            <span className="text-base leading-none">{preset.emoji}</span>
+                            {preset.label}
+                          </>
+                        )}
+                        {ai && (
+                          <span className="absolute top-0.5 right-1 text-[8px] font-bold tracking-wider text-neon-cyan">
+                            AI
+                          </span>
+                        )}
+                        {neural && (
+                          <span className="absolute top-0.5 right-1 text-[8px] font-bold tracking-wider text-neon-pink">
+                            N
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openStyleRefPicker(preset.id)}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          if (hasRef) clearStyleRefFor(preset.id);
+                        }}
+                        disabled={Boolean(stylizing)}
+                        title={
+                          hasRef
+                            ? 'Replace style image (right-click to clear)'
+                            : 'Upload a style image to enable neural transfer'
+                        }
+                        className={`absolute top-0.5 left-0.5 w-5 h-5 rounded text-[10px] font-bold leading-none flex items-center justify-center transition-colors disabled:opacity-50 ${
+                          hasRef
+                            ? 'text-neon-pink hover:bg-white/10'
+                            : 'text-slate-400 hover:text-white hover:bg-white/10'
+                        }`}
+                      >
+                        {hasRef ? '✓' : '+'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              {!imgSrc && (
+                <p className="mt-2 text-[11px] text-slate-500">Load a base image first.</p>
+              )}
             </GlassCard>
 
             <GlassCard hover={false}>

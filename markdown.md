@@ -384,3 +384,22 @@ neyakeditor/
 │   └── gesture-ai/
 │
 └── README.md
+```
+
+---
+
+# Changelog
+
+Per-change docs live under [`docs/`](docs/) — one MD per logical change, each with a back-link to this file.
+
+## 2026-05-28
+
+- [AI styles card (Ghibli / Anime / Cartoon / Sketch)](docs/2026-05-28-ai-styles.md) — feature: one-click AI style buttons in the editor; Replicate-backed when `REPLICATE_STYLE_MODEL` is set, CSS-filter fallback otherwise. Output goes to the merge layer.
+- [Per-hand gesture routing](docs/2026-05-28-gesture-handedness.md) — feature: right hand drives the main image, left hand drives the merge layer; two-hand zoom only fires when both hands are at rest. Camera overlay colours skeletons by side and shows L/R badges.
+- [Merge-layer second-image now renders](docs/2026-05-28-merge-layer-visibility.md) — fix: restructured the canvas JSX so the second image shares a sized wrapper with the first and gets an explicit `z-10`; previously invisible due to stacking + mismatched bounding boxes.
+
+<!--
+  Convention: after any meaningful code change, add a one-line entry above
+  under today's date and create the corresponding `docs/YYYY-MM-DD-slug.md`.
+  Each per-change doc ends with a "← Back to project spec" link to this file.
+-->
