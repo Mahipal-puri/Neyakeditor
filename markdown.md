@@ -397,6 +397,7 @@ Per-change docs live under [`docs/`](docs/) — one MD per logical change, each 
 - [AI styles card (Ghibli / Anime / Cartoon / Sketch)](docs/2026-05-28-ai-styles.md) — feature: one-click AI style buttons in the editor; Replicate-backed when `REPLICATE_STYLE_MODEL` is set, CSS-filter fallback otherwise. Output goes to the merge layer.
 - [Per-hand gesture routing](docs/2026-05-28-gesture-handedness.md) — feature: right hand drives the main image, left hand drives the merge layer; two-hand zoom only fires when both hands are at rest. Camera overlay colours skeletons by side and shows L/R badges.
 - [Merge-layer second-image now renders](docs/2026-05-28-merge-layer-visibility.md) — fix: restructured the canvas JSX so the second image shares a sized wrapper with the first and gets an explicit `z-10`; previously invisible due to stacking + mismatched bounding boxes.
+- [Vercel deployment configuration](docs/2026-05-28-vercel-deployment.md) — infra: added `vercel.json` + root `package.json`, ported all four dev-only `/api/*` middlewares (`remove-bg`, `stylize`, `animegan`, `templates`) to serverless functions under `api/`, so the same client works in production at [vercel.com/mahipal-s-projects1/neyakeditor](https://vercel.com/mahipal-s-projects1/neyakeditor).
 
 <!--
   Convention: after any meaningful code change, add a one-line entry above

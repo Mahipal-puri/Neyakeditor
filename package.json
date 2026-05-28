@@ -1,0 +1,11 @@
+{
+  "name": "neyakeditor",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Vercel deployment shell. The Vite app lives in client/; serverless functions live in api/.",
+  "scripts": {
+    "build": "npm --prefix client install && npm --prefix client run build",
+    "dev": "npm --prefix client run dev"
+  }
+}
